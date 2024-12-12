@@ -14,6 +14,7 @@ pub mod raftpb {
     };
 }
 
+#[allow(clippy::four_forward_slashes)]
 pub mod kvraftpb {
     include!(concat!(env!("OUT_DIR"), "/kvraftpb.rs"));
 
