@@ -7,8 +7,10 @@ pub mod raftpb {
 
             // Your code here if more rpc desired.
             // rpc xxx(yyy) returns (zzz)
+            rpc append_entries(AppendEntriesArgs) returns (AppendEntriesReply);
         }
     }
+    #[allow(unused)]
     pub use self::raft::{
         add_service as add_raft_service, Client as RaftClient, Service as RaftService,
     };
@@ -27,5 +29,6 @@ pub mod kvraftpb {
             // rpc xxx(yyy) returns (zzz)
         }
     }
+    #[allow(unused)]
     pub use self::kv::{add_service as add_kv_service, Client as KvClient, Service as KvService};
 }
