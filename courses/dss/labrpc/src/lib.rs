@@ -417,7 +417,7 @@ pub mod tests {
             pool.spawn_ok(async move {
                 let x = i + 100;
                 // this call ought to return false.
-                let _ = cli.handler2(&JunkArgs { x });
+                drop(cli.handler2(&JunkArgs { x }));
                 sender.send(true).unwrap();
             });
         }
