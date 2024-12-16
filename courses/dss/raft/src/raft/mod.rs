@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -70,6 +71,16 @@ pub enum Role {
     },
 }
 
+impl Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Follower => write!(f, "Follower"),
+            Role::Candidate { .. } => write!(f, "Candidate"),
+            Role::Leader { .. } => write!(f, "Leader"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PersistentState {
     current_term: u64,
@@ -114,12 +125,19 @@ impl Default for VolatileState {
     }
 }
 
+#[derive(Debug)]
 pub enum Event {
     Heartbeat,
     ResetTimeout,
     Timeout,
     RequestVoteReply(usize, RequestVoteReply),
     AppendEntriesReply(usize, AppendEntriesReply),
+}
+
+macro_rules! rlog {
+    ($raft:expr, $($arg:tt)*) => {
+        println!("{} - [#{} @{} as {}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), $raft.me, $raft.p.current_term, $raft.role, format!($($arg)*));
+    };
 }
 
 // A single Raft peer.
@@ -187,28 +205,34 @@ impl Raft {
         rf
     }
 
+    fn turn(&mut self, role: Role) {
+        self.role = role;
+        rlog!(self, "turn to {}", self.role);
+    }
+
     fn turn_follower(&mut self) {
-        self.role = Role::Follower;
+        self.turn(Role::Follower);
     }
 
     fn turn_candidate(&mut self) {
         // Initialize votes to include only self.me
         let mut votes = HashSet::new();
         votes.insert(self.me);
-        self.role = Role::Candidate { votes };
+        self.turn(Role::Candidate { votes });
     }
 
     fn turn_leader(&mut self) {
         let next_index = vec![self.p.log.len(); self.peers.len()];
         let match_index = vec![0; self.peers.len()];
-        self.role = Role::Leader {
+        self.turn(Role::Leader {
             next_index,
             match_index,
-        };
+        });
     }
 
     fn update_term(&mut self, term: u64) {
         if term > self.p.current_term {
+            rlog!(self, "update term to {}", term);
             self.p.current_term = term;
             self.p.voted_for = None;
         } else if term < self.p.current_term {
@@ -345,6 +369,10 @@ impl Raft {
     }
 
     fn handle_event(&mut self, event: Event) {
+        if !matches!(event, Event::Heartbeat) {
+            rlog!(self, "handle event: {:?}", event);
+        }
+
         match event {
             Event::Heartbeat => {
                 self.handle_heartbeat();
@@ -365,6 +393,7 @@ impl Raft {
     fn handle_heartbeat(&mut self) {
         match self.role {
             Role::Leader { .. } => {
+                // rlog!(self, "send heartbeat to all peers");
                 // send heartbeat to all peers
                 for (i, peer) in self.peers.iter().enumerate() {
                     if i == self.me {
@@ -396,6 +425,8 @@ impl Raft {
                 self.update_term(self.p.current_term + 1);
                 self.p.voted_for = Some(self.me);
                 self.send_event(Event::ResetTimeout);
+
+                rlog!(self, "start a new election");
 
                 // ask peers to vote me as leader
                 for (i, peer) in self.peers.iter().enumerate() {
@@ -598,13 +629,13 @@ impl Node {
                     // fuse() is used to convert the timer into a future that can be Poll::Pending after it's been cancelled
                     // If the timer is cancelled, the future will return Poll::Pending; if not fused, it may cause a panic
                     futures_timer::Delay::new(Duration::from_millis(
-                        rand::thread_rng().gen_range(300, 600),
+                        rand::thread_rng().gen_range(500, 1000),
                     ))
                     .fuse()
                 };
 
                 let build_hb_timer =
-                    || futures_timer::Delay::new(Duration::from_millis(100)).fuse();
+                    || futures_timer::Delay::new(Duration::from_millis(150)).fuse();
 
                 let mut timeout_timer = build_rand_timer();
                 let mut hb_timer = build_hb_timer();
@@ -741,12 +772,18 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         // crate::your_code_here(args)
         let mut raft = self.raft.lock().unwrap();
-        raft.handle_request_vote_request(args)
+        rlog!(raft, "rpc - request vote: args: {:?}", args);
+        let reply = raft.handle_request_vote_request(args);
+        rlog!(raft, "rpc - request vote: reply: {:?}", reply);
+        reply
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         // Your code here (2A, 2B).
         let mut raft = self.raft.lock().unwrap();
-        raft.handle_append_entries_request(args)
+        rlog!(raft, "rpc - append entries: args: {:?}", args);
+        let reply = raft.handle_append_entries_request(args);
+        rlog!(raft, "rpc - append entries: reply: {:?}", reply);
+        reply
     }
 }
