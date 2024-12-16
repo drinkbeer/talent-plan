@@ -128,10 +128,14 @@ impl Default for VolatileState {
 #[derive(Debug)]
 pub enum Event {
     Heartbeat,
-    ResetTimeout,
     Timeout,
     RequestVoteReply(usize, RequestVoteReply),
     AppendEntriesReply(usize, AppendEntriesReply),
+}
+
+#[derive(Debug)]
+pub enum TimeoutEvent {
+    ResetTimeout,
 }
 
 macro_rules! rlog {
@@ -160,6 +164,7 @@ pub struct Raft {
     // Channels
     apply_tx: UnboundedSender<ApplyMsg>,
     event_tx: Option<UnboundedSender<Event>>,
+    timer_tx: Option<UnboundedSender<TimeoutEvent>>,
 
     // Executor
     executor: ThreadPool,
@@ -193,6 +198,7 @@ impl Raft {
             role: Role::Follower,
             apply_tx,
             event_tx: None,
+            timer_tx: None,
             executor: ThreadPool::new().unwrap(),
         };
 
@@ -203,6 +209,14 @@ impl Raft {
         rf.turn_follower();
 
         rf
+    }
+
+    fn event_loop_tx(&self) -> &UnboundedSender<Event> {
+        self.event_tx.as_ref().expect("event_tx is not initialized")
+    }
+
+    fn timer_action_tx(&self) -> &UnboundedSender<TimeoutEvent> {
+        self.timer_tx.as_ref().expect("timer_tx is not initialized")
     }
 
     fn turn(&mut self, role: Role) {
@@ -362,8 +376,11 @@ impl Raft {
 }
 
 impl Raft {
-    fn send_event(&mut self, event: Event) {
-        if let Err(e) = self.event_tx.as_ref().unwrap().unbounded_send(event) {
+    fn reset_timeout(&mut self) {
+        if let Err(e) = self
+            .timer_action_tx()
+            .unbounded_send(TimeoutEvent::ResetTimeout)
+        {
             panic!("failed to send event: {:?}", e);
         }
     }
@@ -377,7 +394,6 @@ impl Raft {
             Event::Heartbeat => {
                 self.handle_heartbeat();
             }
-            Event::ResetTimeout => unreachable!(),
             Event::Timeout => {
                 self.handle_timeout();
             }
@@ -391,7 +407,7 @@ impl Raft {
     }
 
     fn handle_heartbeat(&mut self) {
-        match self.role {
+        match &mut self.role {
             Role::Leader { .. } => {
                 // rlog!(self, "send heartbeat to all peers");
                 // send heartbeat to all peers
@@ -399,7 +415,7 @@ impl Raft {
                     if i == self.me {
                         continue;
                     }
-                    let tx = self.event_tx.as_ref().unwrap().clone();
+                    let tx = self.event_loop_tx().clone();
                     let fut = peer.append_entries(&self.append_entries_args(vec![]));
 
                     self.executor
@@ -424,7 +440,7 @@ impl Raft {
                 self.turn_candidate();
                 self.update_term(self.p.current_term + 1);
                 self.p.voted_for = Some(self.me);
-                self.send_event(Event::ResetTimeout);
+                self.reset_timeout();
 
                 rlog!(self, "start a new election");
 
@@ -519,7 +535,7 @@ impl Raft {
                 match &mut self.role {
                     Role::Follower => {
                         // todo: log replication
-                        self.send_event(Event::ResetTimeout);
+                        self.reset_timeout();
                         true
                     }
                     Role::Candidate { .. } => {
@@ -598,11 +614,12 @@ impl Node {
         // Your code here.
         // crate::your_code_here(raft)
         let (event_loop_tx, event_loop_rx) = mpsc::unbounded();
+        let (timer_action_tx, timer_action_rx) = mpsc::unbounded();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let executor = ThreadPool::new().unwrap();
 
         raft.event_tx = Some(event_loop_tx.clone());
-
+        raft.timer_tx = Some(timer_action_tx.clone());
         let node = Node {
             raft: Arc::new(Mutex::new(raft)),
             event_loop_tx,
@@ -611,6 +628,7 @@ impl Node {
         };
 
         node.start_event_loop(event_loop_rx, shutdown_rx);
+        node.start_timer_action_loop(timer_action_rx);
 
         node
     }
@@ -621,11 +639,27 @@ impl Node {
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
         let raft = self.raft.clone();
+
+        self.executor
+            .spawn(async move {
+                loop {
+                    select! {
+                        event = event_loop_rx.select_next_some() => {
+                            raft.lock().unwrap().handle_event(event);
+                        }
+                        _ = shutdown_rx => break, // shutdown the event loop, drop event_loop_rx
+                    }
+                }
+            })
+            .expect("failed to start event loop");
+    }
+
+    fn start_timer_action_loop(&self, mut timer_action_rx: UnboundedReceiver<TimeoutEvent>) {
         let event_loop_tx = self.event_loop_tx.clone();
 
         self.executor
             .spawn(async move {
-                let build_rand_timer = || {
+                let build_timeout_timer = || {
                     // fuse() is used to convert the timer into a future that can be Poll::Pending after it's been cancelled
                     // If the timer is cancelled, the future will return Poll::Pending; if not fused, it may cause a panic
                     futures_timer::Delay::new(Duration::from_millis(
@@ -637,36 +671,28 @@ impl Node {
                 let build_hb_timer =
                     || futures_timer::Delay::new(Duration::from_millis(150)).fuse();
 
-                let mut timeout_timer = build_rand_timer();
+                let mut timeout_timer = build_timeout_timer();
                 let mut hb_timer = build_hb_timer();
 
                 loop {
                     select! {
-                        event = event_loop_rx.select_next_some() => {
-                            match event {
-                                Event::ResetTimeout => {
-                                    timeout_timer = build_rand_timer();
-                                    // Only reset heartbeat timer if we're the leader
-                                    if matches!(raft.lock().unwrap().role, Role::Leader { .. }) {
-                                        hb_timer = build_hb_timer();
-                                    }
-                                },
-                                event => {
-                                    raft.lock().unwrap().handle_event(event);
-                                }
+                        action = timer_action_rx.select_next_some() => {
+                            match action {
+                                TimeoutEvent::ResetTimeout => timeout_timer = build_timeout_timer(),
                             }
                         }
                         _ = timeout_timer => {
-                            event_loop_tx.unbounded_send(Event::Timeout).unwrap();
-                            timeout_timer = build_rand_timer();
+                            match event_loop_tx.unbounded_send(Event::Timeout) {
+                                Ok(_) => timeout_timer = build_timeout_timer(),
+                                Err(_) => break, // event loop is shutdown
+                            }
                         }
                         _ = hb_timer => {
-                            // if matches!(raft.lock().unwrap().role, Role::Leader { .. }) {
-                                event_loop_tx.unbounded_send(Event::Heartbeat).unwrap();
-                            // }
-                            hb_timer = build_hb_timer();
+                            match event_loop_tx.unbounded_send(Event::Heartbeat) {
+                                Ok(_) => hb_timer = build_hb_timer(),
+                                Err(_) => break, // event loop is shutdown
+                            }
                         }
-                        _ = shutdown_rx => break, // shutdown the event loop, drop event_loop_rx
                     }
                 }
             })
